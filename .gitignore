@@ -1,0 +1,9 @@
+config/*.json
+config/models.ini
+backups/*/
+!backups/.gitkeep
+!config/.gitkeep
+models/*
+!models/.gitkeep
+logs/*
+!logs/.gitkeep
