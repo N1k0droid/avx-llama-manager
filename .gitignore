@@ -1,5 +1,7 @@
 config/*.json
 config/models.ini
+config/profiles/*
+!config/profiles/.gitkeep
 backups/*/
 !backups/.gitkeep
 !config/.gitkeep

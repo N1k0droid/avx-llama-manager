@@ -17,6 +17,10 @@ function Show-Legend {
     Write-Info "-ngl          layers offloaded to the GPU: a number, 'all', or 'auto' (default - lets --fit below decide from free VRAM; a fixed number disables --fit for this flag)"
     Write-Info "-c            context size per slot, in tokens"
     Write-Info "-fa           flash-attention: on / off / auto (auto = decided by the backend, not reliable)"
+    Write-Info "-ctk / -ctv   KV cache type for K / V: f16 (default), q8_0 ~halves KV memory, q4_0 ~quarters it; a quantized V needs -fa on"
+    Write-Info "kv-offload    on = KV cache in VRAM (default); off = -nkvo, KV cache in system RAM: frees VRAM, but attention runs on the CPU (slower as context grows)"
+    Write-Info "-t            CPU threads (0 = auto, llama-server decides); matters when layers or KV run on the CPU"
+    Write-Info "extra args    free-form llama-server flags appended last; they override per-model presets too"
     Write-Info "--api-key     key required in the Authorization header (empty = no authentication)"
     Write-Info "--offline     blocks network access, uses only the local model cache"
     Write-Info "--fit         llama-server's own VRAM-fit (confirmed: default on) - shrinks -ngl/-c/offloads tensors to CPU to avoid a CUDA out-of-memory failure at load time"
@@ -25,8 +29,8 @@ function Show-Legend {
     Write-Info "fit-precheck  manager-side, not a llama-server flag: before 'Load model' in the tray, dry-runs llama-fit-params and asks before loading a model that needs CPU offload to fit"
     Write-Info "idle-unload   minutes of no server activity before this manager calls POST /models/unload (0 = never; confirmed: an idle loaded model keeps drawing GPU power, ggml-org/llama.cpp issue #3717 - ~50W vs ~11W idle in that report)"
     if (Test-Path -LiteralPath $ModelsIniPath) {
-        Write-Warn "Found config\models.ini: -fa below is IGNORED, per-model presets take precedence."
-        Write-Info "Manage per-model presets with models.ps1 (Presets menu)."
+        Write-Info "Found config\models.ini: -c, -fa and the KV settings go into its [*] section at start,"
+        Write-Info "so a per-model preset (models.ps1 -> Presets) overrides them for that model."
     }
 }
 
@@ -35,7 +39,8 @@ function Start-TrayMode {
     # independently of this console. $Cfg (Custom start, not saved as default) is
     # written to a temp override file and handed via -ConfigOverridePath, which
     # tray.ps1 reads once and deletes. Omit $Cfg to start with the saved defaults.
-    param($Cfg = $null)
+    # $ProfileName set = that config beats per-model presets; omitted = Auto mode.
+    param($Cfg = $null, [string]$ProfileName = "")
     $trayScript = Join-Path $ScriptsDir "tray.ps1"
     $modelsDir = Get-ModelsDir
     if ($modelsDir) { Test-HfHomeOverride -ModelsDir $modelsDir }
@@ -48,6 +53,12 @@ function Start-TrayMode {
         $overridePath = Join-Path $ConfigDir "launch-override.$([guid]::NewGuid().ToString('N')).json"
         Save-JsonFile -Path $overridePath -Object $Cfg
         $argList += @("-ConfigOverridePath", "`"$overridePath`"")
+    }
+    if ($ProfileName) {
+        $argList += @("-ProfileName", "`"$ProfileName`"")
+        Write-Info "Settings mode: profile '$ProfileName' - its values beat every model's preset."
+    } else {
+        Write-Info "Settings mode: Auto - each model uses its own preset (4.Models.bat -> Presets), the defaults fill the rest."
     }
     try {
         Start-Process -FilePath "powershell.exe" -ArgumentList $argList
@@ -146,6 +157,18 @@ function Show-CustomStartMenu {
         $fa = Read-MenuChoice -Prompt "-fa [on/off/auto] [$($cfg.FlashAttn)] (Enter = keep)" -ValidChoices @("", "on", "off", "auto") -AllowCancel
         $newCfg.FlashAttn = if ($fa -eq "") { $cfg.FlashAttn } else { $fa }
 
+        $newCfg.CacheTypeK = Read-ValidatedCacheType -Prompt "-ctk (KV cache type K)" -Default $cfg.CacheTypeK -AllowCancel
+        $newCfg.CacheTypeV = Read-ValidatedCacheType -Prompt "-ctv (KV cache type V)" -Default $cfg.CacheTypeV -AllowCancel
+        if (Test-KvFlashAttnConflict $newCfg) {
+            Write-Warn "A quantized V cache needs -fa on; with -fa $($newCfg.FlashAttn) loading may fail."
+        }
+        $kvo = Read-MenuChoice -Prompt "kv-offload [on/off] [$($cfg.KvOffload)] (Enter = keep, off = KV cache in system RAM)" -ValidChoices @("", "on", "off") -AllowCancel
+        $newCfg.KvOffload = if ($kvo -eq "") { $cfg.KvOffload } else { $kvo }
+        $newCfg.Threads   = Read-ValidatedInt -Prompt "-t (CPU threads, 0 = auto)" -Default $cfg.Threads -Min 0 -AllowCancel
+        $extraPrompt = if ($cfg.ExtraArgs) { "Extra llama-server args ('-' = clear)" } else { "Extra llama-server args (empty = none)" }
+        $extra = Read-WithDefault -Prompt $extraPrompt -Default $cfg.ExtraArgs -AllowCancel
+        $newCfg.ExtraArgs = if ($extra -eq "-") { "" } else { $extra }
+
         $newCfg.ApiKey  = Read-WithDefault -Prompt "--api-key (empty = none)" -Default $cfg.ApiKey -AllowCancel
         $newCfg.Offline = Confirm-Yes -Prompt "--offline (no network access)?" -DefaultYes $cfg.Offline -AllowCancel
 
@@ -167,8 +190,11 @@ function Show-CustomStartMenu {
             Save-LaunchDefaults $newCfg
             Write-Ok "Settings saved as default."
         }
+        if (Confirm-Yes -Prompt "Also save them as a named profile?" -DefaultYes $false -AllowCancel) {
+            Save-ProfileInteractive $newCfg
+        }
 
-        Start-TrayMode -Cfg $newCfg
+        Start-TrayMode -Cfg $newCfg -ProfileName "Custom"
     } catch [System.OperationCanceledException] {
         Write-Warn "Cancelled, back to the main menu. No changes made."
     }
@@ -212,6 +238,91 @@ function Restore-LaunchDefaults {
     if (-not (Confirm-Yes -Prompt "Restore the factory launch settings?" -DefaultYes $false)) { return }
     Save-LaunchDefaults (Get-FactoryDefaults)
     Write-Ok "Launch settings restored to factory values."
+}
+
+# --- submenu: launch profiles (manager-only, config\profiles\*.json) -----------------
+
+function Save-ProfileInteractive($cfg) {
+    while ($true) {
+        $name = Read-WithDefault -Prompt "Profile name (letters, digits, . _ -)" -Default ""
+        if (-not (Test-ProfileName $name)) {
+            Write-Warn "Invalid name: '$name'."
+            continue
+        }
+        if ((Test-Path -LiteralPath (Get-LaunchProfilePath $name)) -and
+            -not (Confirm-Yes -Prompt "Profile '$name' exists. Overwrite it?" -DefaultYes $false)) {
+            continue
+        }
+        Save-LaunchProfile -name $name -cfg $cfg
+        Write-Ok "Profile '$name' saved to $(Get-LaunchProfilePath $name)."
+        return
+    }
+}
+
+function Select-LaunchProfile {
+    # Returns a profile name, or $null if there are none / the user backs out.
+    $names = Get-LaunchProfileNames
+    if ($names.Count -eq 0) {
+        Write-Warn "No profiles in $ProfilesDir."
+        Write-Info "Create one here (option 4) or copy an example from config\examples\."
+        return $null
+    }
+    Write-Title "Launch profiles"
+    for ($i = 0; $i -lt $names.Count; $i++) { Write-Info "$($i+1)) $($names[$i])" }
+    Write-Info "0) Back"
+    $idx = Read-ValidatedInt -Prompt "Profile number" -Default "" -Min 0 -Max $names.Count
+    if ($idx -eq 0) { return $null }
+    return $names[$idx - 1]
+}
+
+function Show-ProfilesMenu {
+    while ($true) {
+        Write-Host ""
+        Write-Host "Launch profiles (manager-only: named launch settings in config\profiles\)" -ForegroundColor Cyan
+        Write-Host "1) Show a profile"
+        Write-Host "2) Start llama-server with a profile (its values beat model presets; defaults unchanged)"
+        Write-Host "3) Set a profile as the default launch settings"
+        Write-Host "4) Save the current default settings as a profile"
+        Write-Host "5) Delete a profile"
+        Write-Host "0) Back to the main menu"
+        $choice = Read-MenuChoice -Prompt "Choice" -ValidChoices @("0", "1", "2", "3", "4", "5")
+        switch ($choice) {
+            "1" {
+                $name = Select-LaunchProfile
+                if ($name) {
+                    Write-Title "Profile '$name'"
+                    Write-ConfigSummary (Get-LaunchProfile $name)
+                }
+            }
+            "2" {
+                $name = Select-LaunchProfile
+                if ($name) {
+                    $cfg = Get-LaunchProfile $name
+                    Write-ConfigSummary $cfg
+                    if (Test-KvFlashAttnConflict $cfg) {
+                        Write-Warn "A quantized V cache needs -fa on; with -fa $($cfg.FlashAttn) loading may fail."
+                    }
+                    Start-TrayMode -Cfg $cfg -ProfileName $name
+                }
+            }
+            "3" {
+                $name = Select-LaunchProfile
+                if ($name -and (Confirm-Yes -Prompt "Replace the default launch settings with profile '$name'?" -DefaultYes $false)) {
+                    Save-LaunchDefaults (Get-LaunchProfile $name)
+                    Write-Ok "Default launch settings now match profile '$name'."
+                }
+            }
+            "4" { Save-ProfileInteractive (Get-LaunchDefaults) }
+            "5" {
+                $name = Select-LaunchProfile
+                if ($name -and (Confirm-Yes -Prompt "Delete profile '$name'?" -DefaultYes $false)) {
+                    Remove-Item -LiteralPath (Get-LaunchProfilePath $name) -Force
+                    Write-Ok "Profile '$name' deleted."
+                }
+            }
+            "0" { return }
+        }
+    }
 }
 
 # --- submenu: Hugging Face environment variables (HF_HOME / HF_TOKEN) ---------------
@@ -314,7 +425,7 @@ function Show-MainMenu {
     Write-Host "Current server options (used by 1, 2 and 8):" -ForegroundColor DarkGray
     Write-ConfigSummary $cfg
     Write-Host ""
-    Write-Host "1) Start llama-server (tray icon)"
+    Write-Host "1) Start llama-server (tray icon, Auto: each model's preset applies)"
     Write-Host "2) Auto-start"
     Write-Host "3) Custom options"
     Write-Host "4) Change models folder"
@@ -323,6 +434,7 @@ function Show-MainMenu {
     Write-Host "7) Restore default launch settings"
     Write-Host "8) Start llama-server (tray icon + debug console, live server log here)"
     Write-Host "9) Set idle-unload timeout"
+    Write-Host "10) Launch profiles (start, save, set as default)"
     Write-Host "0) Exit"
 }
 
@@ -330,7 +442,7 @@ Read-ModelsDirPrompt | Out-Null
 
 while ($true) {
     Show-MainMenu
-    $choice = Read-MenuChoice -Prompt "Choice" -ValidChoices @("0", "1", "2", "3", "4", "5", "6", "7", "8", "9")
+    $choice = Read-MenuChoice -Prompt "Choice" -ValidChoices @("0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10")
     switch ($choice) {
         "1" { Start-TrayMode }
         "2" { Show-AutoStartMenu }
@@ -341,6 +453,7 @@ while ($true) {
         "7" { Restore-LaunchDefaults }
         "8" { Start-DebugMode }
         "9" { Set-IdleUnloadTimeout }
+        "10" { Show-ProfilesMenu }
         "0" { exit 0 }
     }
 }

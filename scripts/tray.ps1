@@ -5,7 +5,8 @@
 # or the Task Scheduler auto-start action), never run directly.
 param(
     [switch]$AutoStart,          # scheduled-task launch: skip auto-opening the browser
-    [string]$ConfigOverridePath  # one-off launch config from start.ps1's Custom start
+    [string]$ConfigOverridePath, # one-off launch config from start.ps1's Custom start / a profile
+    [string]$ProfileName         # set = that config beats per-model presets ("Custom" for Custom start); empty = Auto
 )
 
 . "$PSScriptRoot\common.ps1"
@@ -40,13 +41,41 @@ $Script:ExitHandler = $null
 $Script:ExpectedStopFlag = [ref]$false
 
 function Initialize-ActiveConfig {
-    # Loaded once per process. Override file is single-use: deleted right after reading.
+    # Loaded once per process; the tray's Profile menu replaces it later (Set-TrayProfile).
+    # Override file is single-use: deleted right after reading.
     if ($ConfigOverridePath -and (Test-Path -LiteralPath $ConfigOverridePath)) {
         $Script:ActiveCfg = Get-LaunchDefaults -Path $ConfigOverridePath
         Remove-Item -LiteralPath $ConfigOverridePath -Force -ErrorAction SilentlyContinue
     } else {
         $Script:ActiveCfg = Get-LaunchDefaults
     }
+    # Auto ($null): each model's preset wins over the launch defaults.
+    # A profile name: that profile's values win over every preset.
+    $Script:ActiveProfile = if ($ProfileName) { $ProfileName } else { $null }
+}
+
+function Get-ProfileModeLabel {
+    if ($Script:ActiveProfile) { "profile '$($Script:ActiveProfile)'" } else { "Auto (per-model presets)" }
+}
+
+function Set-TrayProfile([string]$name) {
+    # $name empty = back to Auto with the saved launch defaults. Restarts the server:
+    # the values are fixed when llama-server starts, and the loaded model is unloaded.
+    if ($name) {
+        if (-not (Test-Path -LiteralPath (Get-LaunchProfilePath $name))) {
+            [System.Windows.Forms.MessageBox]::Show("Profile '$name' not found in $ProfilesDir.", "llama-manager", "OK", "Warning") | Out-Null
+            return
+        }
+        $Script:ActiveCfg = Get-LaunchProfile $name
+        $Script:ActiveProfile = $name
+    } else {
+        $Script:ActiveCfg = Get-LaunchDefaults
+        $Script:ActiveProfile = $null
+    }
+    Write-ServerLog "=== profile changed from the tray: $(Get-ProfileModeLabel) ==="
+    $running = $Script:ServerProcess -and -not $Script:ServerProcess.HasExited
+    if ($running) { Restart-TrayServer } else { Update-TrayState }
+    $NotifyIcon.ShowBalloonTip(4000, "llama-manager", "Now using $(Get-ProfileModeLabel). Load the model again.", [System.Windows.Forms.ToolTipIcon]::Info)
 }
 
 function Open-ServerLog {
@@ -205,7 +234,19 @@ function Start-TrayServer {
         Write-ServerLog "NOTE: HF_HOME is set and may affect model discovery: $val"
     }
 
-    $serverArgs = Build-ServerArgs -cfg $cfg -ModelsDir $modelsDir
+    if (Test-Path -LiteralPath $ModelsIniPath) {
+        # [*] carries -c/-fa/KV for this launch (see Write-ModelsIni), so a Custom start or
+        # a profile applies even with per-model presets.
+        try {
+            Write-ModelsIni -store (Get-PresetStore) -Cfg $cfg -Quiet
+            Write-ServerLog "config\models.ini regenerated from the active launch settings."
+        } catch {
+            Write-ServerLog "WARNING: could not regenerate config\models.ini: $($_.Exception.Message)"
+        }
+    }
+
+    $serverArgs = Build-ServerArgs -cfg $cfg -ModelsDir $modelsDir -ProfileWins:([bool]$Script:ActiveProfile)
+    Write-ServerLog "settings mode: $(Get-ProfileModeLabel)"
 
     $psi = New-Object System.Diagnostics.ProcessStartInfo
     $psi.FileName = $exe
@@ -330,7 +371,12 @@ function Invoke-LoadModel([string]$modelId) {
         if (-not $match) {
             Write-ServerLog "fit pre-check skipped for '$modelId': could not resolve a local file for this alias."
         } else {
-            $fit = Test-ModelFit -ModelPath $match.FullPath -Cfg $cfg
+            # Per-model preset on top of the launch config: what the router will actually use.
+            $fitCfg = Get-EffectiveModelCfg $cfg $match.RelPath -ProfileWins:([bool]$Script:ActiveProfile)
+            if ($fitCfg.KvOffload -eq "off") {
+                Write-ServerLog "NOTE: '$modelId' runs with -nkvo: KV cache in system RAM, attention on the CPU."
+            }
+            $fit = Test-ModelFit -ModelPath $match.FullPath -Cfg $fitCfg
             switch ($fit.Status) {
                 "ToolMissing" {
                     Write-ServerLog "fit pre-check skipped for '$modelId': $($fit.ErrorMessage)"
@@ -438,7 +484,10 @@ function Test-IdleUnload {
 
 function Update-TrayState {
     $running = $Script:ServerProcess -and -not $Script:ServerProcess.HasExited
-    $NotifyIcon.Text = if ($running) { "llama-server: running (PID $($Script:ServerProcess.Id))" } else { "llama-server: stopped" }
+    # NotifyIcon.Text is capped at 63 characters.
+    $mode = if ($Script:ActiveProfile) { $Script:ActiveProfile } else { "Auto" }
+    $text = if ($running) { "llama-server: running - $mode" } else { "llama-server: stopped - $mode" }
+    $NotifyIcon.Text = if ($text.Length -gt 63) { $text.Substring(0, 63) } else { $text }
     $ItemStart.Enabled       = -not $running
     $ItemRestart.Enabled     = $running
     $ItemStop.Enabled        = $running
@@ -463,6 +512,7 @@ $ItemModelsDir   = $Menu.Items.Add("Open models folder")
 $ItemLoadModel   = $Menu.Items.Add("Load model")
 $ItemUnloadModel = $Menu.Items.Add("Unload model")
 $Menu.Items.Add("-") | Out-Null
+$ItemProfile = $Menu.Items.Add("Profile")
 $ItemStart   = $Menu.Items.Add("Start server")
 $ItemRestart = $Menu.Items.Add("Restart server")
 $ItemStop    = $Menu.Items.Add("Stop server")
@@ -498,6 +548,33 @@ $ItemLoadModel.add_DropDownOpening({
         $mi.add_Click({ Invoke-LoadModel $modelId }.GetNewClosure())
     }
 })
+
+# Rebuilt on every open, so profiles saved from start.ps1 meanwhile show up.
+$ItemProfile.add_DropDownOpening({
+    $ItemProfile.DropDownItems.Clear()
+    $auto = $ItemProfile.DropDownItems.Add("Auto (each model's preset)")
+    $auto.Checked = -not $Script:ActiveProfile
+    $auto.add_Click({ Set-TrayProfile "" })
+    $ItemProfile.DropDownItems.Add("-") | Out-Null
+    $names = Get-LaunchProfileNames
+    if ($names.Count -eq 0) {
+        $none = $ItemProfile.DropDownItems.Add("(no profiles in config\profiles)")
+        $none.Enabled = $false
+    }
+    foreach ($n in $names) {
+        $profileName = $n
+        $pi = $ItemProfile.DropDownItems.Add($profileName)
+        $pi.Checked = ($Script:ActiveProfile -eq $profileName)
+        $pi.add_Click({ Set-TrayProfile $profileName }.GetNewClosure())
+    }
+    if ($Script:ActiveProfile -eq "Custom") {
+        $custom = $ItemProfile.DropDownItems.Add("Custom (from 3.Start.bat)")
+        $custom.Checked = $true
+        $custom.Enabled = $false
+    }
+})
+# Placeholder child so Windows draws the submenu arrow before the first opening.
+$ItemProfile.DropDownItems.Add("...") | Out-Null
 
 $NotifyIcon.ContextMenuStrip = $Menu
 $NotifyIcon.add_DoubleClick({ Show-TrayConsole })

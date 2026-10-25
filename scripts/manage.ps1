@@ -108,6 +108,46 @@ function Restore-Release {
     Write-Ok "Restore completed from '$($selected.Name)'."
 }
 
+function Test-CleanCheckout {
+    # git pull refuses to run over local changes and prints only git's own error. The
+    # llama.cpp checkout is not meant to be edited, so changes here are usually leftovers:
+    # a missing index (an interrupted git write, e.g. blocked by Controlled folder access
+    # - then every file shows as deleted) or files skipped at checkout for exceeding
+    # MAX_PATH. Runs in the repository folder; returns $true when it is safe to pull.
+    param([string]$GitExe)
+    & $GitExe config core.longpaths true
+
+    if (-not (Test-Path -LiteralPath ".git\index")) {
+        Write-Warn "The git index (.git\index) is missing: git sees every file as deleted, although they are still on disk."
+        Write-Info "'git reset' rebuilds the index from the current commit without touching any file."
+        if (-not (Confirm-Yes -Prompt "Rebuild the index now?" -DefaultYes $true)) { return $false }
+        & $GitExe reset -q
+        if ($LASTEXITCODE -ne 0) { Write-ErrorMsg "git reset failed (code $LASTEXITCODE)."; return $false }
+        Write-Ok "Index rebuilt."
+    }
+
+    $changes = @(& $GitExe status --porcelain --untracked-files=no)
+    if ($changes.Count -eq 0) { return $true }
+
+    Write-Warn "$($changes.Count) tracked file(s) in the llama.cpp checkout differ from the current commit:"
+    $changes | Select-Object -First 10 | ForEach-Object { Write-Info "  $_" }
+    if ($changes.Count -gt 10) { Write-Info "  ... and $($changes.Count - 10) more" }
+    Write-Info "If you did not edit llama.cpp yourself, these are leftovers and can be discarded."
+    if (-not (Confirm-Yes -Prompt "Discard them (git reset --hard)? Any edit of yours to these files is lost" -DefaultYes $false)) {
+        Write-Info "Update cancelled. Commit or stash your changes in $(Get-Location) and retry."
+        return $false
+    }
+    & $GitExe reset --hard -q
+    if ($LASTEXITCODE -ne 0) { Write-ErrorMsg "git reset --hard failed (code $LASTEXITCODE)."; return $false }
+    $left = @(& $GitExe status --porcelain --untracked-files=no)
+    if ($left.Count -gt 0) {
+        Write-ErrorMsg "$($left.Count) file(s) still differ after the reset (e.g. $($left[0])). Check permissions and path length."
+        return $false
+    }
+    Write-Ok "Checkout restored to the current commit."
+    return $true
+}
+
 function Update-Release {
     $llamaRoot = Get-LlamaRoot
     if (-not (Test-Path -LiteralPath (Join-Path $llamaRoot ".git"))) {
@@ -129,6 +169,7 @@ function Update-Release {
             Write-ErrorMsg "git fetch failed. Check the network connection."
             return
         }
+        if (-not (Test-CleanCheckout -GitExe $gitInfo.Exe)) { return }
 
         $local = (& $gitInfo.Exe rev-parse HEAD 2>$null)
         $remote = (& $gitInfo.Exe rev-parse '@{u}' 2>$null)

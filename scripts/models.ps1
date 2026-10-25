@@ -59,51 +59,16 @@ function Format-LastBenchSummary($store, [string]$key) {
     return ($parts -join " | ") + "  [$($last.Date)]"
 }
 
-# --- presets.json and models.ini --------------------------------------------------------
+# Get-PresetStore / Save-PresetStore / Write-ModelsIni live in common.ps1 (also used by tray.ps1).
 
-function Get-PresetStore {
-    # Global flash-attn is not stored here: Write-ModelsIni reads it from
-    # launch-defaults.json, the single owner of that setting.
-    $default = [pscustomobject]@{
-        Models = [pscustomobject]@{}
-    }
-    return Get-JsonFile -Path $PresetsPath -DefaultObject $default
-}
-
-function Save-PresetStore($store) {
-    Save-JsonFile -Path $PresetsPath -Object $store -Depth 10
-}
-
-function Write-ModelsIni($store) {
-    # [*] mirrors launch-defaults.json's current FlashAttn.
-    $launchCfg = Get-LaunchDefaults
-    $globalFa = $launchCfg.FlashAttn
-
-    $lines = @()
-    $lines += "version = 1"
-    $lines += ""
-    $lines += "[*]"
-    $lines += "flash-attn = $globalFa"
-
-    foreach ($prop in $store.Models.PSObject.Properties) {
-        $m = $prop.Value
-        if (-not $m.Alias) { continue }
-        $overrides = @()
-        if ($m.FlashAttn -and $m.FlashAttn -ne $globalFa) {
-            $overrides += "flash-attn = $($m.FlashAttn)"
-        }
-        if ($m.CtxSize) {
-            $overrides += "ctx-size = $($m.CtxSize)"
-        }
-        if ($overrides.Count -eq 0) { continue }
-        $lines += ""
-        $lines += "[$($m.Alias)]"
-        $lines += $overrides
-    }
-
-    Initialize-ManagerDirs
-    Set-Content -LiteralPath $ModelsIniPath -Value ($lines -join "`r`n") -Encoding UTF8
-    Write-Ok "config\models.ini regenerated ($($store.Models.PSObject.Properties.Count) preset(s))."
+function Format-PresetSummary($p) {
+    $parts = @("flash-attn=$($p.FlashAttn)")
+    if ($p.CtxSize)    { $parts += "ctx-size=$($p.CtxSize)" }
+    if ($p.CacheTypeK) { $parts += "cache-type-k=$($p.CacheTypeK)" }
+    if ($p.CacheTypeV) { $parts += "cache-type-v=$($p.CacheTypeV)" }
+    if ($p.KvOffload)  { $parts += "kv-offload=$($p.KvOffload)" }
+    if ($p.PSObject.Properties["ExtraArgs"] -and $p.ExtraArgs) { $parts += "extra='$($p.ExtraArgs)'" }
+    return ($parts -join ", ")
 }
 
 # --- action: scan and list --------------------------------------------------------------
@@ -123,7 +88,7 @@ function Show-ModelsList([string]$modelsDir) {
         Write-Host ""
         Write-Host "$($m.Index)) $($m.RelPath)" -ForegroundColor White
         Write-Info "Size: $(Format-Bytes $m.SizeBytes)"
-        if ($m.Alias) { Write-Info "Router alias: $($m.Alias)" } else { Write-Info "Router alias: not determinable (outside the HF cache layout)" }
+        if ($m.Alias) { Write-Info "Router alias: $($m.Alias)" } else { Write-Info "Router alias: none - not visible to the router at this depth (use 'Register local file')" }
 
         $summary = Format-LastBenchSummary -store $store -key $m.RelPath
         if ($summary) { Write-Info "Last bench: $summary" }
@@ -131,7 +96,7 @@ function Show-ModelsList([string]$modelsDir) {
         $presetProp = $presets.Models.PSObject.Properties[$m.RelPath]
         if ($presetProp) {
             $p = $presetProp.Value
-            Write-Info "Preset: flash-attn=$($p.FlashAttn)$(if ($p.CtxSize) { ", ctx-size=$($p.CtxSize)" })"
+            Write-Info "Preset: $(Format-PresetSummary $p)"
         }
     }
     return ,$models
@@ -318,56 +283,85 @@ function Invoke-HfCacheCleanup {
 # --- action: register a local file under a synthetic HF-style path -----------------------
 
 function Register-LocalModelAlias([string]$modelsDir) {
-    # Get-ModelAlias only checks the SHAPE of the relative path, not real HF metadata,
-    # so a model placed here by hand gets a usable alias by moving it into that shape.
-    # Whether the router assigns the same id from this fabricated path as from a real
-    # download is unconfirmed - cross-check "Available models (N): ..." at startup.
+    # The router's --models-dir scan only sees a .gguf directly in the folder or one level
+    # down, in a subfolder named after the model (common/preset.cpp). A model deeper than
+    # that is made visible by putting it into its own subfolder {modelsDir}\{name}\: the id
+    # becomes {name}. Regular files are moved; symlinks (HF cache snapshots, LM Studio
+    # links) become hard links to their target, so the original cache stays intact.
     $all = Get-ScannedModels $modelsDir
     $candidates = @($all | Where-Object { -not $_.Alias })
     if ($candidates.Count -eq 0) {
-        Write-Info "Every model already has a determinable alias - nothing to register."
+        Write-Info "Every model is already visible to the router - nothing to register."
         return
     }
 
-    Write-Title "Models without a determinable alias"
+    Write-Title "Models the router cannot see"
     foreach ($m in $candidates) {
-        Write-Info "$($m.Index)) $($m.RelPath)"
+        Write-Info "$($m.Index)) $($m.RelPath)  ($(Format-Bytes $m.SizeBytes))"
     }
     $idx = Read-ValidatedInt -Prompt "`nModel number to register" -Default "" -Min 1 -Max $all.Count
     $selected = $all | Where-Object { $_.Index -eq $idx }
     if (-not $selected -or $selected.Alias) { Write-ErrorMsg "Invalid choice."; return }
 
-    # Repo default excludes the trailing quant segment, matching Get-ModelAlias's rule.
+    $srcDir = Split-Path -Parent $selected.FullPath
     $fileName = Split-Path -Leaf $selected.FullPath
-    $baseName = [System.IO.Path]::GetFileNameWithoutExtension($fileName)
-    $tokens = $baseName -split "-"
-    $repoDefault = if ($tokens.Count -gt 1) { ($tokens[0..($tokens.Count - 2)] -join "-") } else { $baseName }
-
-    Write-Title "Synthetic Hugging Face path"
-    Write-Info "This only changes where the file sits under '$modelsDir' - the file itself is untouched, just moved."
-    Write-Info "Quant tag is taken from the last '-' segment of the filename ($fileName), same as a real download."
-    $org  = Read-WithDefault -Prompt "Org placeholder (arbitrary, HF-style)" -Default "local"
-    $repo = Read-WithDefault -Prompt "Repo placeholder (arbitrary, HF-style)" -Default $repoDefault
-
-    $targetRel = Join-Path (Join-Path (Join-Path "models--$org--$repo" "snapshots") "local") $fileName
-    $targetFull = Join-Path $modelsDir $targetRel
-    if (Test-Path -LiteralPath $targetFull) {
-        Write-ErrorMsg "'$targetRel' already exists. Pick a different org/repo."
-        return
+    $files = @(Get-Item -LiteralPath $selected.FullPath)
+    $nameDefault = [System.IO.Path]::GetFileNameWithoutExtension($fileName)
+    if ($fileName -match "^(.*)-00001-of-(\d{5})\.gguf$") {
+        $nameDefault = $Matches[1]
+        $files = @(Get-ChildItem -LiteralPath $srcDir -Filter "$($Matches[1])-*-of-$($Matches[2]).gguf" -File)
+    }
+    $companions = @(Get-ChildItem -LiteralPath $srcDir -Filter "*.gguf" -File | Where-Object { Test-CompanionGguf $_.Name })
+    if ($companions.Count -gt 0) {
+        Write-Info "Companion files in the same folder: $(($companions | ForEach-Object Name) -join ', ')"
+        Write-Info "(mmproj = vision projector, loaded with the model; mtp-/dspark-/dflash- = speculative draft)"
+        if (Confirm-Yes -Prompt "Bring them along?" -DefaultYes $true) { $files += $companions }
     }
 
-    $targetDir = Split-Path -Parent $targetFull
+    while ($true) {
+        $name = Read-WithDefault -Prompt "Model id (= subfolder name)" -Default $nameDefault
+        if ($name -match '^[^\\/:*?"<>|]+$') { break }
+        Write-Warn "Not a valid folder name: '$name'."
+    }
+    $targetDir = Join-Path $modelsDir $name
+    if (Get-ChildItem -LiteralPath $targetDir -Filter "*.gguf" -File -ErrorAction SilentlyContinue) {
+        Write-ErrorMsg "'$targetDir' already contains .gguf files. Pick a different id."
+        return
+    }
+    $targetRoot = [System.IO.Path]::GetPathRoot((Resolve-Path -LiteralPath $modelsDir).Path)
+
+    # Resolve every source first, so nothing is half-registered if one of them can't be.
+    $plan = @()
+    foreach ($f in $files) {
+        if ($f.LinkType -eq "SymbolicLink") {
+            $t = @($f.Target)[0]
+            $abs = if ([System.IO.Path]::IsPathRooted($t)) { $t } else { [System.IO.Path]::GetFullPath((Join-Path $f.DirectoryName $t)) }
+            if (-not (Test-Path -LiteralPath $abs)) { Write-ErrorMsg "Broken link: $($f.FullName) -> $abs"; return }
+            if ([System.IO.Path]::GetPathRoot($abs) -ne $targetRoot) {
+                Write-ErrorMsg "$($f.Name) points to another drive ($abs): a hard link is not possible. Copy the file into '$modelsDir' manually."
+                return
+            }
+            $plan += [pscustomobject]@{ Name = $f.Name; Source = $abs; Mode = "hardlink" }
+        } else {
+            $plan += [pscustomobject]@{ Name = $f.Name; Source = $f.FullName; Mode = "move" }
+        }
+    }
+
+    Write-Title "Registration plan"
+    foreach ($p in $plan) { Write-Info "$($p.Mode): $($p.Source) -> $targetDir\$($p.Name)" }
+    if (-not (Confirm-Yes -Prompt "Proceed?" -DefaultYes $true)) { Write-Host "Operation cancelled."; return }
+
     New-Item -ItemType Directory -Path $targetDir -Force | Out-Null
-    Move-Item -LiteralPath $selected.FullPath -Destination $targetFull
-
-    $newAlias = Get-ModelAlias -relPath $targetRel
-    if (-not $newAlias) {
-        Write-ErrorMsg "Something is still off in the generated path - alias still not determinable. Moved to: $targetFull"
-        return
+    foreach ($p in $plan) {
+        $dest = Join-Path $targetDir $p.Name
+        if ($p.Mode -eq "move") {
+            Move-Item -LiteralPath $p.Source -Destination $dest
+        } else {
+            New-Item -ItemType HardLink -Path $dest -Target $p.Source | Out-Null
+        }
     }
-    Write-Ok "Moved to: $targetFull"
-    Write-Ok "Alias: $newAlias"
-    Write-Warn "This alias is a guess at what llama-server's router will assign. Confirm it against 'Available models (N): ...' at server startup before relying on a preset built from it."
+    Write-Ok "Registered as '$name' in: $targetDir"
+    Write-Info "The router scans the models folder at startup: restart the server (tray -> Restart) to see it in 'Load model'."
 }
 
 # --- action: scan and benchmark ----------------------------------------------------------
@@ -516,7 +510,11 @@ function Set-ModelPreset {
         [string]$relPath,
         [string]$alias,
         [string]$flashAttn = $null,
-        [string]$ctxSize = $null
+        [string]$ctxSize = $null,
+        [string]$cacheTypeK = $null,
+        [string]$cacheTypeV = $null,
+        [string]$kvOffload = $null,
+        [string]$extraArgs = $null
     )
     if (-not $alias) {
         Write-Warn "Router alias not determinable for this model: the preset will have no effect on models.ini."
@@ -524,10 +522,17 @@ function Set-ModelPreset {
     }
 
     $store = Get-PresetStore
+    # Fields not passed keep their saved value (e.g. the benchmark only sets flash-attn).
+    $old = if ($store.Models.PSObject.Properties[$relPath]) { $store.Models.$relPath } else { $null }
+    $bound = $PSBoundParameters
     $entry = [pscustomobject]@{
-        Alias     = $alias
-        FlashAttn = $flashAttn
-        CtxSize   = $ctxSize
+        Alias      = $alias
+        FlashAttn  = $flashAttn
+        CtxSize    = if ($bound.ContainsKey("ctxSize"))    { $ctxSize }    elseif ($old) { $old.CtxSize }    else { $null }
+        CacheTypeK = if ($bound.ContainsKey("cacheTypeK")) { $cacheTypeK } elseif ($old) { $old.CacheTypeK } else { $null }
+        CacheTypeV = if ($bound.ContainsKey("cacheTypeV")) { $cacheTypeV } elseif ($old) { $old.CacheTypeV } else { $null }
+        KvOffload  = if ($bound.ContainsKey("kvOffload"))  { $kvOffload }  elseif ($old) { $old.KvOffload }  else { $null }
+        ExtraArgs  = if ($bound.ContainsKey("extraArgs"))  { $extraArgs }  elseif ($old -and $old.PSObject.Properties["ExtraArgs"]) { $old.ExtraArgs } else { $null }
     }
     if ($store.Models.PSObject.Properties[$relPath]) {
         $store.Models.$relPath = $entry
@@ -559,7 +564,7 @@ function Show-PresetMenu([string]$modelsDir) {
                 if ($store.Models.PSObject.Properties.Count -eq 0) { Write-Info "No presets." }
                 foreach ($prop in $store.Models.PSObject.Properties) {
                     $m = $prop.Value
-                    Write-Info "$($prop.Name) -> alias=$($m.Alias), flash-attn=$($m.FlashAttn), ctx-size=$($m.CtxSize)"
+                    Write-Info "$($prop.Name) -> alias=$($m.Alias), $(Format-PresetSummary $m)"
                 }
             }
             "2" {
@@ -570,7 +575,16 @@ function Show-PresetMenu([string]$modelsDir) {
                 if (-not $selected) { Write-ErrorMsg "Invalid choice."; continue }
                 $fa = Read-MenuChoice -Prompt "flash-attn for this model [on/off]" -ValidChoices @("on", "off")
                 $ctx = Read-WithDefault -Prompt "Dedicated ctx-size (empty = use the server's global value)" -Default ""
-                Set-ModelPreset -modelsDir $modelsDir -relPath $selected.RelPath -alias $selected.Alias -flashAttn $fa -ctxSize $ctx
+                $ctk = Read-MenuChoice -Prompt "cache-type-k ($($CacheTypes -join '/'), empty = global)" -ValidChoices (@("") + $CacheTypes)
+                $ctv = Read-MenuChoice -Prompt "cache-type-v ($($CacheTypes -join '/'), empty = global)" -ValidChoices (@("") + $CacheTypes)
+                if ($ctv -and (Test-KvFlashAttnConflict ([pscustomobject]@{ CacheTypeV = $ctv; FlashAttn = $fa }))) {
+                    Write-Warn "A quantized V cache needs flash-attn on; with flash-attn $fa loading may fail."
+                }
+                $kvo = Read-MenuChoice -Prompt "kv-offload [on/off] (off = KV cache in system RAM, empty = global)" -ValidChoices @("", "on", "off")
+                $xa = Read-WithDefault -Prompt "Extra llama-server args for this model only, e.g. -ub 2048 -b 2048 (empty = none)" -Default ""
+                Set-ModelPreset -modelsDir $modelsDir -relPath $selected.RelPath -alias $selected.Alias -flashAttn $fa -ctxSize $ctx `
+                    -cacheTypeK $ctk -cacheTypeV $ctv -kvOffload $kvo -extraArgs $xa
+                Write-Info "Presets apply in Auto mode (3.Start.bat -> 1, or tray -> Profile -> Auto). A chosen profile beats them."
             }
             "3" {
                 if ($store.Models.PSObject.Properties.Count -eq 0) { Write-Warn "No presets to delete."; continue }
@@ -612,7 +626,7 @@ function Show-MainMenu {
     Write-Host "2) Download from Hugging Face"
     Write-Host "3) Scan and benchmark"
     Write-Host "4) Presets"
-    Write-Host "5) Register a local file under a synthetic HF path (assign it an alias)"
+    Write-Host "5) Register a local file (own subfolder, so the router sees it)"
     Write-Host "6) Clean orphaned Hugging Face cache blobs"
     Write-Host "0) Exit"
 }

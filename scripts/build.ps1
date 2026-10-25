@@ -62,6 +62,22 @@ if ($gpuCap) {
     Write-Warn "No NVIDIA GPU detected via nvidia-smi"
 }
 
+$cfaFolder = Get-ControlledFolderAccessBlock $llamaRoot
+if ($cfaFolder) {
+    Write-Warn "Microsoft Defender 'Controlled folder access' is ON and protects '$cfaFolder', which contains the build folder."
+    Write-Info "Unlisted programs cannot write there: configure/build fails with misleading 'cannot open file' (C1083) errors,"
+    Write-Info "and git can lose its index. Either install this package outside protected folders (e.g. C:\AI\), or allow"
+    Write-Info "these programs (Windows Security -> Ransomware protection -> Allow an app through Controlled folder access):"
+    Write-Info "  cl.exe, link.exe, lib.exe, mspdbsrv.exe, MSBuild.exe, Tracker.exe, cmake.exe (Visual Studio),"
+    Write-Info "  rc.exe, mt.exe (Windows SDK), nvcc.exe, cudafe++.exe, cicc.exe, ptxas.exe, fatbinary.exe, nvlink.exe (CUDA),"
+    Write-Info "  git.exe (Git\mingw64\bin) and powershell.exe (also needed by the tray for logs\)."
+    Write-Info "Blocked programs are listed in Event Viewer: Microsoft-Windows-Windows Defender/Operational, event 1123."
+    if (-not (Confirm-Yes -Prompt "Continue anyway (only if those programs are already allowed)?" -DefaultYes $false)) {
+        Write-Host "Operation cancelled."
+        exit 0
+    }
+}
+
 if (-not $gitOk -or -not $cmakeOk -or -not $vsInfo.Found) {
     Write-Host ""
     Write-ErrorMsg "Missing required prerequisites (see [ERROR] lines above)."
@@ -136,6 +152,7 @@ switch ($cpuChoice) {
 # --- 3. CUDA -------------------------------------------------------------------
 
 $cudaFlags = @()
+$cudaToolset = $null
 $useCuda = $false
 if ($nvccInfo.Found) {
     $useCuda = Confirm-Yes -Prompt "`nEnable CUDA support?" -DefaultYes $true
@@ -163,6 +180,20 @@ if ($useCuda) {
         # nvcc not on PATH: point CMake at it explicitly, or CUDA detection fails.
         $cudaFlags += "-DCMAKE_CUDA_COMPILER=$($nvccInfo.Exe)"
     }
+    # The VS generator ignores CMAKE_CUDA_COMPILER and picks the newest CUDA MSBuild
+    # integration; "-T cuda=<root>" pins the toolkit detected above instead.
+    $cudaToolkit = Get-CudaToolkitInfo $nvccInfo.Exe
+    if ($cudaToolkit) {
+        if ($cudaToolkit.OtherToolkits.Count -gt 0) {
+            Write-Info "Other CUDA toolkits installed: $($cudaToolkit.OtherToolkits -join ', ') (CUDA_PATH = $env:CUDA_PATH)"
+        }
+        if ($cudaToolkit.HasVsIntegration) {
+            $cudaToolset = "cuda=$($cudaToolkit.Root)"
+        } else {
+            Write-Warn "No Visual Studio integration for CUDA $($cudaToolkit.Version) (BuildCustomizations\CUDA $($cudaToolkit.Version).props)."
+            Write-Warn "Visual Studio will use its newest CUDA integration instead, which may be a different toolkit."
+        }
+    }
 } else {
     $cudaFlags = @("-DGGML_CUDA=OFF")
 }
@@ -184,6 +215,7 @@ Write-Info "Destination      : $llamaRoot"
 Write-Info "Generator        : $generator"
 Write-Info "CPU              : $cpuLabel"
 Write-Info "CUDA             : $(if ($useCuda) { 'ON, arch ' + $arch } else { 'OFF' })"
+if ($cudaToolset) { Write-Info "CUDA toolkit     : $($cudaToolkit.Root)" }
 Write-Info "SSL/BoringSSL    : $(if ($useSsl) { 'ON' } else { 'OFF' })"
 
 if (-not (Confirm-Yes -Prompt "`nStart clone and build now?" -DefaultYes $true)) {
@@ -196,6 +228,7 @@ if (-not (Confirm-Yes -Prompt "`nStart clone and build now?" -DefaultYes $true))
 if (Test-Path -LiteralPath (Join-Path $llamaRoot ".git")) {
     Write-Warn "Repository already present in $llamaRoot, skipping clone."
     Write-Info "To update an existing installation use manage.ps1 (Update option)."
+    if ($gitInfo.Exe) { & $gitInfo.Exe -C $llamaRoot config core.longpaths true }
 } else {
     Write-Title "Cloning repository"
     if (-not $gitInfo.Exe) {
@@ -204,7 +237,9 @@ if (Test-Path -LiteralPath (Join-Path $llamaRoot ".git")) {
     }
     $parent = Split-Path -Parent $llamaRoot
     if (-not (Test-Path -LiteralPath $parent)) { New-Item -ItemType Directory -Path $parent -Force | Out-Null }
-    & $gitInfo.Exe clone https://github.com/ggml-org/llama.cpp.git $llamaRoot
+    # Some web UI sources exceed MAX_PATH from a deep install folder; without long paths
+    # they are silently skipped at checkout and every later pull sees them as deleted.
+    & $gitInfo.Exe clone -c core.longpaths=true https://github.com/ggml-org/llama.cpp.git $llamaRoot
     if ($LASTEXITCODE -ne 0) {
         Write-ErrorMsg "git clone failed (code $LASTEXITCODE)."
         exit 1
@@ -220,7 +255,22 @@ if (-not $cmakeInfo.Exe) {
 }
 Push-Location $llamaRoot
 try {
-    $cmakeArgs = @("-B", "build", "-G", $generator, "-A", "x64") + $cpuFlags + $cudaFlags + $sslFlags
+    # CMake refuses to reconfigure a build folder with a different toolset (e.g. another
+    # CUDA toolkit than last time): drop the stale cache, the sources are untouched.
+    $cachePath = Join-Path $llamaRoot "build\CMakeCache.txt"
+    if (Test-Path -LiteralPath $cachePath) {
+        $hit = Select-String -LiteralPath $cachePath -Pattern '^CMAKE_GENERATOR_TOOLSET:INTERNAL=(.*)$' | Select-Object -First 1
+        $oldToolset = if ($hit) { $hit.Matches[0].Groups[1].Value } else { "" }
+        $newToolset = if ($cudaToolset) { $cudaToolset } else { "" }
+        if (($oldToolset -replace '\\', '/') -ne ($newToolset -replace '\\', '/')) {
+            Write-Warn "Toolset changed ('$oldToolset' -> '$newToolset'): removing the old CMake cache in build\."
+            Remove-Item -LiteralPath $cachePath -Force
+            Remove-Item -LiteralPath (Join-Path $llamaRoot "build\CMakeFiles") -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+    $cmakeArgs = @("-B", "build", "-G", $generator, "-A", "x64")
+    if ($cudaToolset) { $cmakeArgs += @("-T", $cudaToolset) }
+    $cmakeArgs += $cpuFlags + $cudaFlags + $sslFlags
     Write-Info "$($cmakeInfo.Exe) $($cmakeArgs -join ' ')"
     & $cmakeInfo.Exe @cmakeArgs
     if ($LASTEXITCODE -ne 0) {

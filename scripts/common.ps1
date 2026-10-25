@@ -16,11 +16,15 @@ $Script:LaunchDefaultsPath  = Join-Path $ConfigDir "launch-defaults.json"
 $Script:BenchResultsPath    = Join-Path $ConfigDir "bench-results.json"
 $Script:PresetsPath         = Join-Path $ConfigDir "presets.json"
 $Script:ModelsIniPath       = Join-Path $ConfigDir "models.ini"
+$Script:ProfilesDir         = Join-Path $ConfigDir "profiles"
 $Script:ServerLogPath       = Join-Path $LogsDir "server.log"
 $Script:TrayIconPath        = Join-Path $ManagerRoot "assets\tray.ico"
 
+# Accepted by -ctk/-ctv (tools/server/README.md). Anything but f16/bf16/f32 on V needs flash-attn.
+$Script:CacheTypes = @("f16", "bf16", "f32", "q8_0", "q5_1", "q5_0", "q4_1", "q4_0", "iq4_nl")
+
 function Initialize-ManagerDirs {
-    foreach ($dir in @($ConfigDir, $BackupsDir, $BundledModelsDir, $LogsDir)) {
+    foreach ($dir in @($ConfigDir, $ProfilesDir, $BackupsDir, $BundledModelsDir, $LogsDir)) {
         if (-not (Test-Path -LiteralPath $dir)) {
             New-Item -ItemType Directory -Path $dir -Force | Out-Null
         }
@@ -146,6 +150,31 @@ function Read-ValidatedNgl {
         if (Test-NglValue $raw) { return $raw }
         Write-Host "  Invalid value: '$raw' (must be 'auto', 'all', or a non-negative integer)." -ForegroundColor Yellow
     }
+}
+
+function Test-CacheTypeValue([string]$value) {
+    return $value -in $CacheTypes
+}
+
+function Read-ValidatedCacheType {
+    param([string]$Prompt, $Default, [switch]$AllowCancel)
+    while ($true) {
+        $raw = Read-WithDefault -Prompt $Prompt -Default $Default -AllowCancel:$AllowCancel
+        if (Test-CacheTypeValue $raw) { return $raw }
+        Write-Host "  Invalid value: '$raw' (must be one of: $($CacheTypes -join ', '))." -ForegroundColor Yellow
+    }
+}
+
+function Test-ProfileName([string]$value) {
+    # Becomes a file name under config\profiles\.
+    return $value -match '^[A-Za-z0-9._-]{1,64}$'
+}
+
+function Split-ExtraArgs([string]$text) {
+    # Whitespace-separated tokens; a "double-quoted value" stays one token (quotes dropped).
+    if ([string]::IsNullOrWhiteSpace($text)) { return ,@() }
+    $tokens = @([regex]::Matches($text, '"[^"]*"|\S+') | ForEach-Object { $_.Value.Trim('"') })
+    return ,$tokens
 }
 
 # --- json persistence ----------------------------------------------------------
@@ -277,41 +306,114 @@ function Get-ModelKey([string]$modelsDir, [string]$fullPath) {
     return $rel
 }
 
-function Get-ModelAlias([string]$relPath) {
-    # Heuristic from the HF cache layout (models--{org}--{repo}\snapshots\{hash}\
-    # {filename}.gguf): alias = "{org}/{repo}:{QUANT}", QUANT = last hyphen-separated
-    # token of the filename, upper-cased. Not llama-server's own algorithm - cross-check
-    # against the "Available models" list it prints at startup.
-    if ($relPath -notmatch "models--([^\\/]+)--([^\\/]+)[\\/]snapshots[\\/][^\\/]+[\\/]([^\\/]+)\.gguf$") {
-        return $null
+function Test-CompanionGguf([string]$fileName) {
+    # Files llama-server's --models-dir scan never loads as a model on their own
+    # (common/preset.cpp): projectors ("mmproj" anywhere in the name) and speculative
+    # draft sidecars (mtp-/dspark-/dflash- prefix).
+    return ($fileName -match "mmproj") -or ($fileName -match "^(mtp|dspark|dflash)-")
+}
+
+function Get-ModelAlias([string]$relPath, [bool]$IsHfCache = $false) {
+    # Model id the router assigns, from the path relative to the models folder.
+    # --models-dir rules (common/preset.cpp, load_from_models_dir):
+    #   {file}.gguf directly in the folder        -> "{file}"
+    #   {subdir}\{file}.gguf, one level deep       -> "{subdir}" (shard -00001-of- or the single model file)
+    # HF cache layout, only when the models folder IS the cache the router reads ($IsHfCache):
+    #   models--{org}--{repo}\snapshots\{hash}\{file}.gguf -> "{org}/{repo}:{QUANT}", QUANT = last
+    #   hyphen-separated token of the filename, upper-cased (a heuristic, not llama-server's code).
+    # Anything else is invisible to the router: $null. Cross-check "Available models" at startup.
+    $parts = @($relPath -split "[\\/]")
+    $fileName = $parts[-1]
+    if (Test-CompanionGguf $fileName) { return $null }
+    if ($parts.Count -eq 1) {
+        return [System.IO.Path]::GetFileNameWithoutExtension($fileName)
     }
-    $org = $Matches[1]
-    $repo = $Matches[2]
-    $fileName = $Matches[3]
-    $tokens = $fileName -split "-"
-    $quant = $tokens[$tokens.Count - 1].ToUpper()
-    return "$org/$repo`:$quant"
+    if ($parts.Count -eq 2) {
+        # Later shards belong to the -00001-of- file's model.
+        if ($fileName -match "-\d{5}-of-\d{5}\.gguf$" -and $fileName -notmatch "-00001-of-") { return $null }
+        return $parts[0]
+    }
+    if ($IsHfCache -and $relPath -match "^models--([^\\/]+)--([^\\/]+)[\\/]snapshots[\\/][^\\/]+[\\/](?:.+[\\/])?([^\\/]+)\.gguf$") {
+        $org = $Matches[1]; $repo = $Matches[2]; $base = $Matches[3]
+        # Split models: only the first shard is the model; the shard suffix is not the quant.
+        if ($base -match "-\d{5}-of-\d{5}$") {
+            if ($base -notmatch "-00001-of-\d{5}$") { return $null }
+            $base = $base -replace "-\d{5}-of-\d{5}$", ""
+        }
+        $tokens = $base -split "-"
+        return "$org/$repo`:$($tokens[$tokens.Count - 1].ToUpper())"
+    }
+    return $null
+}
+
+function Get-GgufFileSize($file) {
+    # Symlinks (HF cache snapshots, LM Studio links) report 0 bytes: measure their target.
+    # Unsloth's cache chains two links (snapshot -> repo blob -> shared hub\blobs), so
+    # follow a few hops.
+    for ($hop = 0; $hop -lt 4 -and $file -and $file.LinkType -eq "SymbolicLink"; $hop++) {
+        $t = @($file.Target)[0]
+        $abs = if ([System.IO.Path]::IsPathRooted($t)) { $t } else { [System.IO.Path]::GetFullPath((Join-Path $file.DirectoryName $t)) }
+        $file = Get-Item -LiteralPath $abs -ErrorAction SilentlyContinue
+    }
+    if ($file -and $file.LinkType -ne "SymbolicLink") { return $file.Length }
+    return 0
 }
 
 function Get-ScannedModels([string]$modelsDir) {
-    # Excludes mmproj-* (projector files) and ggml-vocab-* (llama.cpp's own test
-    # files under its cloned models\ folder, reachable from a recursive scan here).
-    $files = Get-ChildItem -LiteralPath $modelsDir -Recurse -Filter "*.gguf" -File -ErrorAction SilentlyContinue |
-        Where-Object { $_.Name -notmatch "^mmproj" -and $_.Name -notmatch "^ggml-vocab-" }
+    # Every model the router can list, from both of its sources:
+    #   the models folder (--models-dir)       RelPath relative to it
+    #   the HF cache ({HF_HOME or default}\hub) RelPath "cache\..." relative to the hub
+    # Loadable models only: skips companion files (projectors, draft sidecars), shards
+    # after -00001-of- (listed once, via their first shard) and ggml-vocab-* (llama.cpp's
+    # own test files under its cloned models\ folder, reachable from a recursive scan).
+    $modelsRoot = (Resolve-Path -LiteralPath $modelsDir).Path.TrimEnd('\')
+    $hubDir = Join-Path (Get-EffectiveHfDownloadDir) "hub"
+    $hubRoot = if (Test-Path -LiteralPath $hubDir) { (Resolve-Path -LiteralPath $hubDir).Path.TrimEnd('\') } else { $null }
+
+    $sources = @()
+    if ($hubRoot -and $hubRoot -eq $modelsRoot) {
+        # The models folder IS the cache: one scan, HF naming.
+        $sources += [pscustomobject]@{ Root = $modelsRoot; Prefix = ""; IsHfCache = $true }
+    } else {
+        $sources += [pscustomobject]@{ Root = $modelsRoot; Prefix = ""; IsHfCache = $false }
+        if ($hubRoot) { $sources += [pscustomobject]@{ Root = $hubRoot; Prefix = "cache\"; IsHfCache = $true } }
+    }
 
     $list = @()
     $i = 1
-    foreach ($f in ($files | Sort-Object FullName)) {
-        $rel = Get-ModelKey -modelsDir $modelsDir -fullPath $f.FullName
-        $list += [pscustomobject]@{
-            Index     = $i
-            FullPath  = $f.FullName
-            RelPath   = $rel
-            Alias     = Get-ModelAlias $rel
-            SizeBytes = $f.Length
+    foreach ($src in $sources) {
+        $files = Get-ChildItem -LiteralPath $src.Root -Recurse -Filter "*.gguf" -File -ErrorAction SilentlyContinue |
+            Where-Object {
+                -not (Test-CompanionGguf $_.Name) -and $_.Name -notmatch "^ggml-vocab-" -and
+                -not ($_.Name -match "-\d{5}-of-\d{5}\.gguf$" -and $_.Name -notmatch "-00001-of-")
+            }
+        # A cache nested inside the models folder is listed once, as the cache.
+        if (-not $src.IsHfCache -and $hubRoot -and $hubRoot.StartsWith("$modelsRoot\", [StringComparison]::OrdinalIgnoreCase)) {
+            $files = $files | Where-Object { -not $_.FullName.StartsWith("$hubRoot\", [StringComparison]::OrdinalIgnoreCase) }
         }
-        $i++
+        foreach ($f in ($files | Sort-Object FullName)) {
+            $rel = Get-ModelKey -modelsDir $src.Root -fullPath $f.FullName
+            # Shards: report the whole model's size, not just the first file.
+            $group = @($f)
+            if ($f.Name -match "^(.*)-00001-of-(\d{5})\.gguf$") {
+                $group = @(Get-ChildItem -LiteralPath $f.DirectoryName -Filter "$($Matches[1])-*-of-$($Matches[2]).gguf" -File)
+            }
+            $size = ($group | ForEach-Object { Get-GgufFileSize $_ } | Measure-Object -Sum).Sum
+            $list += [pscustomobject]@{
+                Index     = $i
+                FullPath  = $f.FullName
+                RelPath   = "$($src.Prefix)$rel"
+                Alias     = Get-ModelAlias $rel $src.IsHfCache
+                SizeBytes = $size
+            }
+            $i++
+        }
     }
+    # Two model files in one subfolder: the router loads only one of them (whichever its
+    # directory scan sees last), so neither alias can be trusted.
+    $dupes = $list | Where-Object { $_.Alias -and $_.RelPath -match "^[^\\/]+[\\/][^\\/]+$" } |
+        Group-Object Alias | Where-Object { $_.Count -gt 1 }
+    foreach ($g in $dupes) { foreach ($m in $g.Group) { $m.Alias = $null } }
     # Unary comma: prevents PowerShell from unrolling a 1-element array on return.
     return ,$list
 }
@@ -341,6 +443,10 @@ function Test-ModelFit {
         "--fit-target", $Cfg.FitTarget,
         "--fit-ctx", $Cfg.FitCtx
     )
+    # KV cache type/placement changes how much fits; -fa matters once V is quantized.
+    # Only added when non-default, so a factory config runs the same dry-run as before.
+    $kvArgs = Get-KvServerArgs $Cfg
+    if ($kvArgs.Count -gt 0) { $fitArgs += @("-fa", $Cfg.FlashAttn) + $kvArgs }
     try {
         $output = & $exe @fitArgs
         $exitCode = $LASTEXITCODE
@@ -368,6 +474,17 @@ function Get-FactoryDefaults {
         Ngl              = "auto"
         CtxSize          = 12288
         FlashAttn        = "off"
+        # KV cache (-ctk/-ctv/-nkvo). f16/f16/on are llama-server's own defaults, so
+        # nothing is passed until changed. KvOffload "off" keeps the KV cache in system
+        # RAM: frees VRAM for weights, but attention then runs on the CPU.
+        CacheTypeK       = "f16"
+        CacheTypeV       = "f16"
+        KvOffload        = "on"
+        # -t: 0 = not passed, llama-server picks the thread count.
+        Threads          = 0
+        # Free-form llama-server flags appended last. The command line wins over
+        # config\models.ini, so these also override every per-model preset.
+        ExtraArgs        = ""
         ApiKey           = ""
         Offline          = $false
         # Manager-only, not a llama-server flag: tray.ps1 calls POST /models/unload
@@ -406,6 +523,154 @@ function Save-LaunchDefaults($cfg) {
     Save-JsonFile -Path $LaunchDefaultsPath -Object $cfg
 }
 
+# --- launch profiles (manager-only: named copies of launch-defaults.json) ----------
+
+function Get-LaunchProfilePath([string]$name) {
+    return (Join-Path $ProfilesDir "$name.json")
+}
+
+function Get-LaunchProfileNames {
+    $names = @(Get-ChildItem -LiteralPath $ProfilesDir -Filter "*.json" -File -ErrorAction SilentlyContinue |
+        Sort-Object Name | ForEach-Object { $_.BaseName })
+    return ,$names
+}
+
+function Get-LaunchProfile([string]$name) {
+    # Same normalization as the defaults: fields missing from an older profile get factory values.
+    return Get-LaunchDefaults -Path (Get-LaunchProfilePath $name)
+}
+
+function Save-LaunchProfile([string]$name, $cfg) {
+    Save-JsonFile -Path (Get-LaunchProfilePath $name) -Object $cfg
+}
+
+# --- presets.json and models.ini ----------------------------------------------------
+# Here rather than in models.ps1: tray.ps1 regenerates models.ini from the active
+# config at server start, and resolves per-model presets for the fit pre-check.
+
+function Get-PresetStore {
+    # Global flash-attn/ctx-size/KV values are not stored here: Write-ModelsIni reads
+    # them from the launch config, the single owner of those settings.
+    $default = [pscustomobject]@{
+        Models = [pscustomobject]@{}
+    }
+    return Get-JsonFile -Path $PresetsPath -DefaultObject $default
+}
+
+function Save-PresetStore($store) {
+    Save-JsonFile -Path $PresetsPath -Object $store -Depth 10
+}
+
+function Write-ModelsIni {
+    # llama-server precedence: command line > model section > [*]. So with a models.ini,
+    # Build-ServerArgs leaves -c/-fa/KV flags off the command line and [*] carries them,
+    # otherwise per-model ctx-size/flash-attn/KV overrides would never apply.
+    # $Cfg = the launch config being started (default: launch-defaults.json).
+    param($store, $Cfg = $null, [switch]$Quiet)
+    if (-not $Cfg) { $Cfg = Get-LaunchDefaults }
+    $globalFa = $Cfg.FlashAttn
+
+    $lines = @()
+    $lines += "version = 1"
+    $lines += ""
+    $lines += "[*]"
+    $lines += "flash-attn = $globalFa"
+    $lines += "ctx-size = $($Cfg.CtxSize)"
+    if ($Cfg.CacheTypeK -ne "f16") { $lines += "cache-type-k = $($Cfg.CacheTypeK)" }
+    if ($Cfg.CacheTypeV -ne "f16") { $lines += "cache-type-v = $($Cfg.CacheTypeV)" }
+    if ($Cfg.KvOffload -eq "off") { $lines += "no-kv-offload = true" }
+
+    foreach ($prop in $store.Models.PSObject.Properties) {
+        $m = $prop.Value
+        if (-not $m.Alias) { continue }
+        $overrides = @()
+        if ($m.FlashAttn -and $m.FlashAttn -ne $globalFa) {
+            $overrides += "flash-attn = $($m.FlashAttn)"
+        }
+        if ($m.CtxSize) {
+            $overrides += "ctx-size = $($m.CtxSize)"
+        }
+        if ($m.CacheTypeK -and $m.CacheTypeK -ne $Cfg.CacheTypeK) {
+            $overrides += "cache-type-k = $($m.CacheTypeK)"
+        }
+        if ($m.CacheTypeV -and $m.CacheTypeV -ne $Cfg.CacheTypeV) {
+            $overrides += "cache-type-v = $($m.CacheTypeV)"
+        }
+        if ($m.KvOffload -and $m.KvOffload -ne $Cfg.KvOffload) {
+            # Boolean keys negate via the "no-" prefix, not "= false".
+            $overrides += $(if ($m.KvOffload -eq "off") { "no-kv-offload = true" } else { "kv-offload = true" })
+        }
+        if ($m.PSObject.Properties["ExtraArgs"] -and $m.ExtraArgs) {
+            $overrides += ConvertTo-IniArgLines $m.ExtraArgs
+        }
+        if ($overrides.Count -eq 0) { continue }
+        $lines += ""
+        $lines += "[$($m.Alias)]"
+        $lines += $overrides
+    }
+
+    Initialize-ManagerDirs
+    # No BOM: Windows PowerShell 5.1's "Set-Content -Encoding UTF8" writes one, and
+    # llama-server then refuses the whole file ("failed to parse server config file").
+    [System.IO.File]::WriteAllText($ModelsIniPath, ($lines -join "`r`n") + "`r`n", (New-Object System.Text.UTF8Encoding($false)))
+    if (-not $Quiet) {
+        Write-Ok "config\models.ini regenerated ($($store.Models.PSObject.Properties.Count) preset(s))."
+    }
+}
+
+function ConvertTo-IniArgLines([string]$text) {
+    # "-ub 2048 -b 2048 --no-mmap" -> "ub = 2048", "b = 2048", "no-mmap = true".
+    # models.ini keys are the flag names without dashes (short forms work too); a flag
+    # not followed by a value is boolean. A value starting with "-" is read as the next
+    # flag, except a negative number.
+    $tokens = Split-ExtraArgs $text
+    $lines = @()
+    for ($i = 0; $i -lt $tokens.Count; $i++) {
+        $tok = $tokens[$i]
+        if ($tok -notmatch '^-{1,2}([^-].*)$') { continue }
+        $key = $Matches[1]
+        $next = if ($i + 1 -lt $tokens.Count) { $tokens[$i + 1] } else { $null }
+        if ($null -ne $next -and ($next -notmatch '^-' -or $next -match '^-\d')) {
+            $lines += "$key = $next"
+            $i++
+        } else {
+            $lines += "$key = true"
+        }
+    }
+    return ,$lines
+}
+
+function Get-EffectiveModelCfg {
+    # Launch config with this model's preset applied on top - what the router will use.
+    # -ProfileWins: a profile is active, so its values beat the preset (Build-ServerArgs).
+    param($cfg, [string]$relPath, [switch]$ProfileWins)
+    $eff = $cfg.PSObject.Copy()
+    if ($ProfileWins) { return $eff }
+    $prop = (Get-PresetStore).Models.PSObject.Properties[$relPath]
+    if (-not $prop) { return $eff }
+    foreach ($key in @("FlashAttn", "CtxSize", "CacheTypeK", "CacheTypeV", "KvOffload")) {
+        if ($prop.Value.PSObject.Properties[$key] -and $prop.Value.$key) {
+            $eff.$key = $prop.Value.$key
+        }
+    }
+    return $eff
+}
+
+function Test-KvFlashAttnConflict($cfg) {
+    # Quantized V cache needs flash-attn; with "off" (or an "auto" that resolves off) loading fails.
+    return ($cfg.CacheTypeV -notin @("f16", "bf16", "f32")) -and ($cfg.FlashAttn -ne "on")
+}
+
+function Get-KvServerArgs($cfg) {
+    # Only what differs from llama-server's own defaults, so a factory config produces
+    # the same command line as before these settings existed.
+    $kvArgs = @()
+    if ($cfg.CacheTypeK -and $cfg.CacheTypeK -ne "f16") { $kvArgs += @("-ctk", $cfg.CacheTypeK) }
+    if ($cfg.CacheTypeV -and $cfg.CacheTypeV -ne "f16") { $kvArgs += @("-ctv", $cfg.CacheTypeV) }
+    if ($cfg.KvOffload -eq "off") { $kvArgs += "-nkvo" }
+    return ,$kvArgs
+}
+
 function Write-ConfigSummary($cfg) {
     # Labels match Show-Legend in start.ps1.
     Write-Info "--host        = $($cfg.BindHost)"
@@ -414,6 +679,10 @@ function Write-ConfigSummary($cfg) {
     Write-Info "-ngl          = $($cfg.Ngl)"
     Write-Info "-c            = $($cfg.CtxSize)"
     Write-Info "-fa           = $($cfg.FlashAttn)"
+    Write-Info "-ctk / -ctv   = $($cfg.CacheTypeK) / $($cfg.CacheTypeV)"
+    Write-Info "kv-offload    = $($cfg.KvOffload)$(if ($cfg.KvOffload -eq 'off') { ' (-nkvo: KV cache in system RAM, attention on CPU)' })"
+    Write-Info "-t            = $(if ($cfg.Threads -gt 0) { $cfg.Threads } else { 'auto' })"
+    Write-Info "extra args    = $(if ($cfg.ExtraArgs) { $cfg.ExtraArgs } else { '(none)' })"
     Write-Info "--api-key     = $(if ($cfg.ApiKey) { $cfg.ApiKey } else { '(none)' })"
     Write-Info "--offline     = $($cfg.Offline)"
     Write-Info "--fit         = $($cfg.FitEnabled) (target $($cfg.FitTarget) MiB/device, min ctx $($cfg.FitCtx))"
@@ -421,24 +690,32 @@ function Write-ConfigSummary($cfg) {
     Write-Info "idle-unload   = $(if ($cfg.IdleUnloadMinutes -gt 0) { "$($cfg.IdleUnloadMinutes) min (manager-side, not a llama-server flag)" } else { 'disabled' })"
 }
 
-function Build-ServerArgs($cfg, [string]$ModelsDir) {
+function Build-ServerArgs {
+    # Auto mode (default): with a models.ini, -c/-fa/KV live in its [*] section (see
+    # Write-ModelsIni), so each model's preset section overrides them.
+    # -ProfileWins (a profile or Custom start chose them): -c/-fa/KV go on the command
+    # line, which llama-server ranks above every models.ini section, presets included.
+    param($cfg, [string]$ModelsDir, [switch]$ProfileWins)
     $serverArgs = @(
         "--host", $cfg.BindHost,
         "--port", $cfg.Port,
         "--models-dir", $ModelsDir,
         "--models-max", $cfg.ModelsMax,
-        "-ngl", $cfg.Ngl,
-        "-c", $cfg.CtxSize,
+        "-ngl", $cfg.Ngl
+    )
+    $hasIni = Test-Path -LiteralPath $ModelsIniPath
+    if ($hasIni) { $serverArgs += @("--models-preset", $ModelsIniPath) }
+    if ($ProfileWins -or -not $hasIni) {
+        $serverArgs += @("-c", $cfg.CtxSize, "-fa", $cfg.FlashAttn) + (Get-KvServerArgs $cfg)
+    }
+    $serverArgs += @(
         "--fit", $cfg.FitEnabled,
         "--fit-target", $cfg.FitTarget,
         "--fit-ctx", $cfg.FitCtx
     )
-    if (Test-Path -LiteralPath $ModelsIniPath) {
-        $serverArgs += @("--models-preset", $ModelsIniPath)
-    } else {
-        $serverArgs += @("-fa", $cfg.FlashAttn)
-    }
+    if ($cfg.Threads -gt 0) { $serverArgs += @("-t", $cfg.Threads) }
     if ($cfg.ApiKey) { $serverArgs += @("--api-key", $cfg.ApiKey) }
+    $serverArgs += Split-ExtraArgs $cfg.ExtraArgs
     return $serverArgs
 }
 
@@ -688,6 +965,46 @@ function Get-NvccInfo {
         $result.VersionText = if ($line) { $line.Matches[0].Groups[1].Value } else { "unknown" }
     } catch {}
     return $result
+}
+
+function Get-CudaToolkitInfo([string]$nvccExe) {
+    # Toolkit root of the nvcc that was detected, and whether Visual Studio has the MSBuild
+    # integration for that version. The VS generator otherwise builds with the newest
+    # integration installed (usually the one CUDA_PATH points to), which can be a
+    # different toolkit than the one reported here.
+    $exe = if ($nvccExe -eq "nvcc") { (Get-Command nvcc -ErrorAction SilentlyContinue).Source } else { $nvccExe }
+    if (-not $exe) { return $null }
+    $root = Split-Path -Parent (Split-Path -Parent $exe)
+    $version = $null
+    if ((Split-Path -Leaf $root) -match '^v(\d+\.\d+)$') { $version = $Matches[1] }
+    $integration = $false
+    if ($version) {
+        $integration = [bool](Get-Item -Path "${env:ProgramFiles}\Microsoft Visual Studio\*\*\MSBuild\Microsoft\VC\*\BuildCustomizations\CUDA $version.props" -ErrorAction SilentlyContinue)
+    }
+    $others = @(Get-ChildItem "${env:ProgramFiles}\NVIDIA GPU Computing Toolkit\CUDA" -Directory -Filter "v*" -ErrorAction SilentlyContinue |
+        Where-Object { $_.FullName -ne $root } | ForEach-Object Name)
+    return [pscustomobject]@{ Root = $root; Version = $version; HasVsIntegration = $integration; OtherToolkits = $others }
+}
+
+function Get-ControlledFolderAccessBlock([string]$path) {
+    # Microsoft Defender "Controlled folder access": when enabled, unlisted programs (the
+    # compiler, git, PowerShell itself) cannot write into protected folders, and the build
+    # fails with misleading "cannot open file" errors. Returns the protected folder that
+    # contains $path, or $null. Default protected folders + the user-added ones.
+    try {
+        $pref = Get-MpPreference -ErrorAction Stop
+    } catch {
+        return $null
+    }
+    if ($pref.EnableControlledFolderAccess -ne 1) { return $null }
+    $folders = @("MyDocuments", "Desktop", "MyPictures", "MyVideos", "MyMusic", "Favorites" |
+        ForEach-Object { [Environment]::GetFolderPath($_) }) + @($pref.ControlledFolderAccessProtectedFolders)
+    $full = [System.IO.Path]::GetFullPath($path).TrimEnd('\') + '\'
+    foreach ($f in ($folders | Where-Object { $_ })) {
+        $prefix = [System.IO.Path]::GetFullPath([Environment]::ExpandEnvironmentVariables($f)).TrimEnd('\') + '\'
+        if ($full.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase)) { return $prefix.TrimEnd('\') }
+    }
+    return $null
 }
 
 function Test-CudaArchValue([string]$value) {

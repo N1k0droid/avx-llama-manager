@@ -1,0 +1,20 @@
+{
+    "BindHost":  "127.0.0.1",
+    "Port":  5001,
+    "ModelsMax":  1,
+    "Ngl":  "auto",
+    "CtxSize":  32768,
+    "FlashAttn":  "on",
+    "CacheTypeK":  "q8_0",
+    "CacheTypeV":  "q8_0",
+    "KvOffload":  "on",
+    "Threads":  0,
+    "ExtraArgs":  "",
+    "ApiKey":  "",
+    "Offline":  false,
+    "IdleUnloadMinutes":  0,
+    "FitEnabled":  "on",
+    "FitTarget":  1024,
+    "FitCtx":  8192,
+    "FitPreCheck":  "on"
+}
