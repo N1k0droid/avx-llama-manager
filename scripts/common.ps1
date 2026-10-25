@@ -420,6 +420,27 @@ function Get-ScannedModels([string]$modelsDir) {
 
 # --- VRAM fit pre-check ----------------------------------------------------------
 
+function Invoke-NativeCapture {
+    # Runs an executable and returns { ExitCode; StdOut; StdErr }. Unlike "& $exe" it also
+    # keeps stderr, where llama.cpp tools log the reason they failed, so the tray can show it.
+    param([string]$FilePath, [string[]]$ArgumentList)
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = $FilePath
+    $psi.Arguments = ($ArgumentList | ForEach-Object {
+        if ("$_" -match '[\s"]') { '"' + ("$_" -replace '"', '\"') + '"' } else { "$_" }
+    }) -join ' '
+    $psi.UseShellExecute = $false
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+    $psi.CreateNoWindow = $true
+    $proc = [System.Diagnostics.Process]::Start($psi)
+    # Read stderr asynchronously so neither pipe can fill up and block the child.
+    $errTask = $proc.StandardError.ReadToEndAsync()
+    $out = $proc.StandardOutput.ReadToEnd()
+    $proc.WaitForExit()
+    return [pscustomobject]@{ ExitCode = $proc.ExitCode; StdOut = $out; StdErr = $errTask.Result }
+}
+
 function Test-ModelFit {
     # Dry-run wrapper around llama.cpp's llama-fit-params tool (tools/fit-params):
     # queries real free device memory, reads only GGUF metadata, does not load the
@@ -448,16 +469,17 @@ function Test-ModelFit {
     $kvArgs = Get-KvServerArgs $Cfg
     if ($kvArgs.Count -gt 0) { $fitArgs += @("-fa", $Cfg.FlashAttn) + $kvArgs }
     try {
-        $output = & $exe @fitArgs
-        $exitCode = $LASTEXITCODE
+        $run = Invoke-NativeCapture -FilePath $exe -ArgumentList $fitArgs
     } catch {
         return [pscustomobject]@{ Status = "Failed"; RawArgs = ""; ErrorMessage = $_.Exception.Message }
     }
-    $outputText = ($output | Out-String).Trim()
-    if ($exitCode -ne 0) {
+    $outputText = $run.StdOut.Trim()
+    if ($run.ExitCode -ne 0) {
+        # The tool logs to stderr; its last lines say why it gave up.
+        $reason = (($run.StdErr -split "`r?`n") | Where-Object { $_.Trim() } | Select-Object -Last 3) -join " | "
         return [pscustomobject]@{
             Status = "Failed"; RawArgs = $outputText
-            ErrorMessage = "llama-fit-params exited with code ${exitCode}."
+            ErrorMessage = "llama-fit-params exited with code $($run.ExitCode). $reason"
         }
     }
     $status = if ($outputText -match '-ot\s') { "NeedsCpuOffload" } else { "Fits" }

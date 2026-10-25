@@ -278,10 +278,11 @@ Right-click the tray icon:
 | Show console/logs | Opens a window with the live server log |
 | Launch WebUI | Opens the server Web UI in a browser |
 | Open models folder | Opens the configured models directory |
-| Load model | Lists models from the router and loads one, after an optional VRAM fit check |
+| Model: ... | Informational line under VRAM status: the loaded model, its state and context size, refreshed when the menu opens |
+| Load model | Lists models from the router (the loaded one is ticked) and loads one, after an optional VRAM fit check |
 | Unload model | Unloads models currently known to the router |
 | Profile | Switches between **Auto** (each model's preset) and a saved profile (its values for every model); restarts the server. The active one is ticked |
-| Start / Restart / Stop | Controls `llama-server` without closing the tray manager |
+| Start / Restart / Stop | Controls `llama-server` without closing the tray manager. The browser opens only on the tray's first start; after a restart or a profile change, a notification asks to reload the Web UI page |
 | Exit | Closes the tray manager |
 
 ### VRAM fit check

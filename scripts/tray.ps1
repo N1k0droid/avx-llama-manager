@@ -34,6 +34,7 @@ $Script:LogWriter = $null
 $Script:MaxLogBytes = 10MB
 $Script:BrowserJob = $null
 $Script:ActiveCfg = $null
+$Script:BrowserOpened = $false
 $Script:ExitHandler = $null
 # [ref] rather than a plain bool: the exit-handler action (below) can read this
 # reliably but cannot write it back reliably from its isolated scope. Only
@@ -75,7 +76,9 @@ function Set-TrayProfile([string]$name) {
     Write-ServerLog "=== profile changed from the tray: $(Get-ProfileModeLabel) ==="
     $running = $Script:ServerProcess -and -not $Script:ServerProcess.HasExited
     if ($running) { Restart-TrayServer } else { Update-TrayState }
-    $NotifyIcon.ShowBalloonTip(4000, "llama-manager", "Now using $(Get-ProfileModeLabel). Load the model again.", [System.Windows.Forms.ToolTipIcon]::Info)
+    $NotifyIcon.ShowBalloonTip(6000, "llama-manager - $(Get-ProfileModeLabel)",
+        "Server restarted. Reload the Web UI page (F5), then load the model again (tray -> Load model, or pick it in the Web UI).",
+        [System.Windows.Forms.ToolTipIcon]::Info)
 }
 
 function Open-ServerLog {
@@ -273,9 +276,12 @@ function Start-TrayServer {
     Update-TrayState
 
     Stop-BrowserJob
-    if (-not $AutoStart) {
+    # Browser only on this tray's first start: after a Restart or a profile change the
+    # Web UI is usually still open, so a new tab would just pile up (Launch WebUI opens one).
+    if (-not $AutoStart -and -not $Script:BrowserOpened) {
         $Script:BrowserJob = Start-BrowserWhenReady -BindHost $cfg.BindHost -Port $cfg.Port
     }
+    $Script:BrowserOpened = $true
 }
 
 function Stop-TrayServer {
@@ -346,14 +352,28 @@ function Open-ModelsFolder {
     Start-Process -FilePath $modelsDir
 }
 
-function Get-ServerModelList {
-    # Queries the server's own /v1/models rather than re-deriving aliases locally.
+function Get-ServerModelStatus {
+    # Router GET /models: every model with status.value ("loaded", "loading", "unloaded")
+    # and status.args, the command line its instance gets - read for the context size.
     try {
-        $resp = Invoke-RestMethod -Uri "$(Get-ServerUrl)/v1/models" -Method Get -TimeoutSec 3
-        return @($resp.data | ForEach-Object { $_.id })
+        $resp = Invoke-RestMethod -Uri "$(Get-ServerUrl)/models" -Method Get -TimeoutSec 3
     } catch {
-        return @()
+        return ,@()
     }
+    $list = @($resp.data | ForEach-Object {
+        $state = if ($_.status) { $_.status.value } else { "unknown" }
+        $ctx = $null
+        $a = @($_.status.args)
+        $i = [array]::IndexOf($a, "--ctx-size")
+        if ($i -ge 0 -and $i + 1 -lt $a.Count) { $ctx = $a[$i + 1] }
+        [pscustomobject]@{ Id = $_.id; State = $state; CtxSize = $ctx }
+    })
+    return ,$list
+}
+
+function Get-ServerLoadedModels {
+    # Unloading an unloaded model returns 400, so only target loaded/loading ones.
+    return @((Get-ServerModelStatus) | Where-Object { $_.State -ne "unloaded" } | ForEach-Object { $_.Id })
 }
 
 function Invoke-LoadModel([string]$modelId) {
@@ -366,7 +386,9 @@ function Invoke-LoadModel([string]$modelId) {
         $modelsDir = Get-ModelsDir
         $match = $null
         if ($modelsDir) {
-            $match = Get-ScannedModels $modelsDir | Where-Object { $_.Alias -eq $modelId } | Select-Object -First 1
+            # Parentheses: Get-ScannedModels returns its list as ONE object (unary comma), so
+            # piping it directly hands Where-Object the whole array and every path matches.
+            $match = (Get-ScannedModels $modelsDir) | Where-Object { $_.Alias -eq $modelId } | Select-Object -First 1
         }
         if (-not $match) {
             Write-ServerLog "fit pre-check skipped for '$modelId': could not resolve a local file for this alias."
@@ -441,20 +463,18 @@ function Invoke-UnloadModel([string]$modelId) {
 }
 
 function Invoke-UnloadAllModels {
-    # Tray "Unload model": unloads every model /v1/models reports, not a single
-    # pick - llama-server does not document a "currently loaded" query here.
-    $models = Get-ServerModelList
+    # Tray "Unload model": unloads every model the router reports as loaded.
+    $models = Get-ServerLoadedModels
     if ($models.Count -eq 0) {
-        Write-ServerLog "Unload model requested but no models are known to the server."
+        Write-ServerLog "Unload model requested but no model is loaded."
         return
     }
     foreach ($modelId in $models) { Invoke-UnloadModel $modelId }
 }
 
 function Invoke-IdleUnload {
-    # POST /models/unload for each currently loaded model (llama.cpp Model
-    # Management). Unloading an already-unloaded model is assumed harmless.
-    $models = Get-ServerModelList
+    # POST /models/unload for each currently loaded model (llama.cpp Model Management).
+    $models = Get-ServerLoadedModels
     if ($models.Count -eq 0) { return }
     $url = "$(Get-ServerUrl)/models/unload"
     $headers = @{}
@@ -505,6 +525,8 @@ $NotifyIcon.Visible = $true
 $Menu = New-Object System.Windows.Forms.ContextMenuStrip
 $ItemGpuInfo     = $Menu.Items.Add("VRAM: -")
 $ItemGpuInfo.Enabled = $false   # informational only, never clickable
+$ItemModelInfo   = $Menu.Items.Add("Model: -")
+$ItemModelInfo.Enabled = $false # informational only
 $Menu.Items.Add("-") | Out-Null
 $ItemConsole     = $Menu.Items.Add("Show console / logs")
 $ItemWebUI       = $Menu.Items.Add("Launch WebUI")
@@ -523,7 +545,10 @@ $ItemConsole.add_Click({ Show-TrayConsole })
 $ItemWebUI.add_Click({ Show-WebUI })
 $ItemModelsDir.add_Click({ Open-ModelsFolder })
 $ItemStart.add_Click({ Start-TrayServer })
-$ItemRestart.add_Click({ Restart-TrayServer })
+$ItemRestart.add_Click({
+    Restart-TrayServer
+    $NotifyIcon.ShowBalloonTip(5000, "llama-manager", "Server restarted. Reload the Web UI page (F5) and load the model again.", [System.Windows.Forms.ToolTipIcon]::Info)
+})
 $ItemStop.add_Click({ Stop-TrayServer })
 $ItemUnloadModel.add_Click({ Invoke-UnloadAllModels })
 $ItemExit.add_Click({
@@ -536,15 +561,18 @@ $ItemExit.add_Click({
 
 $ItemLoadModel.add_DropDownOpening({
     $ItemLoadModel.DropDownItems.Clear()
-    $models = Get-ServerModelList
+    $models = Get-ServerModelStatus
     if ($models.Count -eq 0) {
         $placeholder = $ItemLoadModel.DropDownItems.Add("(no models found)")
         $placeholder.Enabled = $false
         return
     }
     foreach ($m in $models) {
-        $modelId = $m
-        $mi = $ItemLoadModel.DropDownItems.Add($modelId)
+        $modelId = $m.Id
+        # Ticked = loaded now; "(loading...)" while the router is still starting it.
+        $label = if ($m.State -eq "loading") { "$modelId   (loading...)" } else { $modelId }
+        $mi = $ItemLoadModel.DropDownItems.Add($label)
+        $mi.Checked = ($m.State -eq "loaded")
         $mi.add_Click({ Invoke-LoadModel $modelId }.GetNewClosure())
     }
 })
@@ -586,6 +614,19 @@ $Menu.add_Opening({
         "VRAM: $($info.FreeMiB) / $($info.TotalMiB) MiB free"
     } else {
         "VRAM: unavailable (nvidia-smi not found)"
+    }
+    $running = $Script:ServerProcess -and -not $Script:ServerProcess.HasExited
+    $active = if ($running) { @((Get-ServerModelStatus) | Where-Object { $_.State -ne "unloaded" }) } else { @() }
+    $ItemModelInfo.Text = if (-not $running) {
+        "Model: server stopped"
+    } elseif ($active.Count -eq 0) {
+        "Model: none loaded"
+    } else {
+        ($active | ForEach-Object {
+            $id = if ($_.Id.Length -gt 60) { $_.Id.Substring(0, 57) + "..." } else { $_.Id }
+            $ctx = if ($_.CtxSize) { ", ctx $($_.CtxSize)" } else { "" }
+            "Model: $id ($($_.State)$ctx)"
+        }) -join " | "
     }
 })
 
