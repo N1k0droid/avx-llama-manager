@@ -64,7 +64,7 @@ The toolkit uses double-click `.bat` launchers and does not require a separate m
 
 ## Installation
 
-Clone the repository (once published under this name):
+Clone the repository, or download it as a ZIP from GitHub and extract it. Put it outside protected folders such as Documents if Defender's Controlled folder access is on:
 
 ```powershell
 git clone https://github.com/N1k0droid/avx-llama-manager.git
